@@ -100,5 +100,4 @@ pip install pandas numpy scikit-learn xgboost shap matplotlib jupyter ipykernel
 Ashim Maity  
 B.Tech Data Science Engineering  
 
-## License
-MIT License
+
