@@ -1,73 +1,117 @@
-import pandas as pd
+import warnings
+warnings.filterwarnings('ignore')
+
 import numpy as np
-import shap
+import pandas as pd
 import xgboost as xgb
+import shap
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
 
-# Load Dataset
-df = pd.read_csv("retail_sales_dataset.csv")
+DATA_PATH = "retail_sales_dataset.csv"
+RANDOM_SEED = 42
+TEST_SIZE = 0.2
+SEASON_MAP = {12:0,1:0,2:0,3:1,4:1,5:1,6:2,7:2,8:2,9:3,10:3,11:3}
 
-# Drop unnecessary columns
-df = df.drop(columns=["Transaction ID","Customer ID","Date"])
+FEATURES = [
+    'Age','AgeGroup','Gender_enc','Category_enc',
+    'Quantity','Price per Unit','Month','DayOfWeek',
+    'Quarter','WeekOfYear','IsWeekend','Season',
+    'CatAvgSpend',
+    'PriceQuantityInteraction',
+    'AgePriceInteraction'
+]
 
-# Encode categorical variables
-le_gender = LabelEncoder()
-df["Gender"] = le_gender.fit_transform(df["Gender"])
+df = pd.read_csv(DATA_PATH)
 
-le_category = LabelEncoder()
-df["Product Category"] = le_category.fit_transform(df["Product Category"])
+df['Date'] = pd.to_datetime(df['Date'])
+df['Month'] = df['Date'].dt.month
+df['DayOfWeek'] = df['Date'].dt.dayofweek
+df['Quarter'] = df['Date'].dt.quarter
+df['WeekOfYear'] = df['Date'].dt.isocalendar().week.astype(int)
+df['IsWeekend'] = (df['DayOfWeek'] >= 5).astype(int)
+df['Season'] = df['Month'].map(SEASON_MAP)
+df['AgeGroup'] = np.clip((df['Age'] - 18)//10, 0, 4)
 
-# Define Features and Target
-X = df.drop(columns=["Total Amount"])
-y = df["Total Amount"]
-
-# Train Test Split
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42
+df['PriceQuantityInteraction'] = np.log1p(
+    df['Price per Unit'] * df['Quantity']
 )
 
-# XGBoost Model
+df['AgePriceInteraction'] = df['Age'] * df['Price per Unit']
+
+df['Gender_enc'] = LabelEncoder().fit_transform(df['Gender'])
+df['Category_enc'] = LabelEncoder().fit_transform(df['Product Category'])
+
+train_df, test_df = train_test_split(df, test_size=TEST_SIZE, random_state=RANDOM_SEED)
+
+# Leak-free CatAvgSpend
+cat_avg_map = train_df.groupby('Product Category')['Total Amount'].mean().to_dict()
+fallback = train_df['Total Amount'].mean()
+
+train_df['CatAvgSpend'] = train_df['Product Category'].map(cat_avg_map).fillna(fallback)
+test_df['CatAvgSpend'] = test_df['Product Category'].map(cat_avg_map).fillna(fallback)
+
+X_train = train_df[FEATURES].astype(float)
+y_train = train_df['Total Amount'].astype(float)
+
+X_test = test_df[FEATURES].astype(float)
+y_test = test_df['Total Amount'].astype(float)
+
 model = xgb.XGBRegressor(
-    n_estimators=300,
-    learning_rate=0.05,
-    max_depth=6,
-    subsample=0.8,
-    colsample_bytree=0.8,
-    random_state=42
+    n_estimators=160,
+    max_depth=3,
+    learning_rate=0.06,
+    subsample=0.65,
+    colsample_bytree=0.65,
+    min_child_weight=12,
+    gamma=2.0,
+    reg_alpha=2.0,
+    reg_lambda=5.0,
+    random_state=42,
+    n_jobs=-1
 )
 
 model.fit(X_train, y_train)
 
-# Predictions
 y_pred = model.predict(X_test)
 
-# Evaluation Metrics
-rmse = np.sqrt(mean_squared_error(y_test, y_pred))
 mae = mean_absolute_error(y_test, y_pred)
+rmse = np.sqrt(mean_squared_error(y_test, y_pred))
 r2 = r2_score(y_test, y_pred)
 
-# Relative Absolute Error
-rae = np.sum(np.abs(y_test - y_pred)) / np.sum(np.abs(y_test - np.mean(y_test)))
+mape = np.mean(np.abs((y_test - y_pred) / (y_test + 1e-9))) * 100
+accuracy = max(0, 100 - mape)
 
-# Accuracy (based on MAPE)
-mape = np.mean(np.abs((y_test - y_pred) / y_test)) * 100
-accuracy = 100 - mape
+print("\nFinal Model Performance")
+print(f"R2       : {r2:.4f}")
+print(f"MAE      : Rs {mae:.2f}")
+print(f"RMSE     : Rs {rmse:.2f}")
+print(f"Accuracy : {accuracy:.2f}%")
 
-print("Model Performance:")
-print("Accuracy:", round(accuracy,2),"%")
-print("RMSE:", round(rmse,2))
-print("RAE:", round(rae,4))
-print("R2 Score:", round(r2,4))
+explainer = shap.TreeExplainer(model)
 
-# SHAP Explainability
-explainer = shap.Explainer(model)
-shap_values = explainer(X_test)
+sample = X_test.sample(min(200, len(X_test)), random_state=42)
+shap_values = explainer.shap_values(sample)
 
-# SHAP plot
-shap.summary_plot(shap_values, X_test)
-shap.plots.bar(shap_values)
-shap.plots.waterfall(shap_values[0])
-shap.dependence_plot("Quantity", shap_values.values, X_test)
+shap.summary_plot(shap_values, sample)
+shap.summary_plot(shap_values, sample, plot_type="bar")
+
+idx = 0
+
+shap.plots.waterfall(
+    shap.Explanation(
+        values=shap_values[idx],
+        base_values=explainer.expected_value,
+        data=sample.iloc[idx],
+        feature_names=sample.columns
+    )
+)
+
+shap.dependence_plot(
+    "Price per Unit",
+    shap_values,
+    sample,
+    interaction_index="Quantity"
+)
